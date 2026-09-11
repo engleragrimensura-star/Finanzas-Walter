@@ -578,8 +578,17 @@ function trabajoHtml(t) {
       '</div>'+
     '</div>'+
     '<div class="work-progress"><div class="work-progress-bar" style="width:'+pct+'%"></div></div>'+
-    (t.aportes && !t.aportes.pagado && t.aportes.total > 0 ?
-      '<div style="font-size:11px;color:var(--amber);margin-bottom:6px">⚠ Aportes pendientes: '+fmt(t.aportes.total)+'</div>' : '')+
+    (t.aportes && t.aportes.total > 0 ?
+      '<div style="background:var(--s1);border-radius:8px;padding:8px 10px;margin-bottom:6px;font-size:12px">'+
+        '<div style="font-weight:600;margin-bottom:4px;color:var(--t2)">APORTES</div>'+
+        (t.aportes.items||[]).map(function(a){
+          return '<div style="display:flex;justify-content:space-between"><span>'+a.desc+'</span><span style="font-weight:600">'+fmt(a.monto)+'</span></div>';
+        }).join('')+
+        '<div style="display:flex;justify-content:space-between;border-top:1px solid var(--s2);margin-top:4px;padding-top:4px;font-weight:700">'+
+          '<span>Total aportes</span>'+
+          '<span style="color:'+(t.aportes.pagado?'var(--green)':'var(--amber)')+'">'+fmt(t.aportes.total)+(t.aportes.pagado?' ✓':' ⚠')+'</span>'+
+        '</div>'+
+      '</div>' : '')+
     repartoHtml+
     '<div style="margin-top:10px">'+cuotasHtml+'</div>'+
     '<div class="work-actions">'+
@@ -807,9 +816,37 @@ function movHtml(m) {
     '</div>'+
     '<div style="display:flex;align-items:center;gap:6px">'+
       '<span class="mov-val '+cls+'">'+val+'</span>'+
+      '<button onclick="editarMov('+m.id+')" style="background:none;border:none;font-size:15px;cursor:pointer;color:var(--t2)">✎</button>'+
       '<button onclick="eliminarMov('+m.id+')" style="background:none;border:none;font-size:16px;cursor:pointer;color:var(--t2)">🗑</button>'+
     '</div>'+
   '</div>';
+}
+
+function editarMov(id) {
+  var m = DB.movimientos.find(function(x){return x.id===id;});
+  if (!m) return;
+  var ctasOpts = DB.cuentas.filter(function(c){return c.uso!=='tarjeta';})
+    .map(function(c){return '<option value="'+c.id+'"'+(m.cuenta===c.id?' selected':'')+'>'+c.nombre+'</option>';}).join('');
+  var cats = m.tipo==='ingreso' ? CATS_ING : CATS_EGR;
+  var catsOpts = cats.map(function(c){return '<option'+(m.cat===c?' selected':'')+'>'+c+'</option>';}).join('');
+  document.getElementById('confirm-titulo').textContent = 'Editar movimiento';
+  document.getElementById('confirm-msg').innerHTML =
+    '<div class="form-row"><label>Descripción</label><input id="edit-desc" value="'+m.desc+'" style="width:100%;padding:8px;border:1px solid var(--s2);border-radius:8px;font-size:14px"></div>'+
+    '<div class="form-row"><label>Monto ($)</label><input id="edit-monto" type="number" value="'+m.monto+'" style="width:100%;padding:8px;border:1px solid var(--s2);border-radius:8px;font-size:14px"></div>'+
+    '<div class="form-row"><label>Fecha</label><input id="edit-fecha" type="date" value="'+m.fecha+'" style="width:100%;padding:8px;border:1px solid var(--s2);border-radius:8px;font-size:14px"></div>'+
+    '<div class="form-row"><label>Categoría</label><select id="edit-cat" style="width:100%;padding:8px;border:1px solid var(--s2);border-radius:8px;font-size:14px">'+catsOpts+'</select></div>'+
+    '<div class="form-row"><label>Cuenta</label><select id="edit-cuenta" style="width:100%;padding:8px;border:1px solid var(--s2);border-radius:8px;font-size:14px">'+ctasOpts+'</select></div>';
+  document.getElementById('confirm-ok').textContent = 'Guardar';
+  document.getElementById('confirm-ok').onclick = function(){
+    m.desc   = document.getElementById('edit-desc').value.trim() || m.desc;
+    m.monto  = parseFloat(document.getElementById('edit-monto').value)||m.monto;
+    m.fecha  = document.getElementById('edit-fecha').value || m.fecha;
+    m.cat    = document.getElementById('edit-cat').value;
+    m.cuenta = document.getElementById('edit-cuenta').value;
+    saveDB(); cerrarModal('modal-confirm'); renderMovs(); renderInicio();
+    toast('Movimiento actualizado ✓');
+  };
+  document.getElementById('modal-confirm').classList.add('show');
 }
 
 function ctaNombre(cid) {
@@ -931,7 +968,8 @@ function guardarMovimiento() {
 // ── OFRENDA ──────────────────────────────────────────────────────
 function renderOfrenda() {
   var mk = mesKey();
-  // Calcular ofrenda real basada en cobros
+
+  // Calcular ofrenda real basada en cobros de cada trabajo
   DB.trabajos.forEach(function(t){
     var cobrado = (t.cuotas||[]).filter(function(c){return c.pagado;}).reduce(function(s,c){return s+c.monto;},0);
     if (cobrado === 0) return;
@@ -941,28 +979,36 @@ function renderOfrenda() {
     var ofrMonto = Math.round(neto * 0.1);
     var entry = DB.ofrenda.find(function(o){return o.trabajoId===t.id;});
     if (entry) { entry.base=neto; entry.monto=ofrMonto; }
-    else DB.ofrenda.push({trabajoId:t.id, base:neto, monto:ofrMonto, pagado:false, movId:null});
+    else DB.ofrenda.push({trabajoId:t.id, base:neto, monto:ofrMonto, pagado:false, movId:null, fechaTrabajo:t.fecha});
   });
 
-  var total = DB.ofrenda.reduce(function(s,o){return s+o.monto;},0);
-  var dado  = DB.ofrenda.filter(function(o){return o.pagado;}).reduce(function(s,o){return s+o.monto;},0);
+  // Filtrar ofrendas del mes — por fecha del trabajo o del pago
+  var ofrsMes = DB.ofrenda.filter(function(o){
+    var t = DB.trabajos.find(function(x){return x.id===o.trabajoId;});
+    var fechaTrab = t ? t.fecha : '';
+    var fechaPago = o.movId ? (DB.movimientos.find(function(m){return m.id===o.movId;})||{}).fecha||'' : '';
+    // Mostrar si el trabajo es del mes O si fue dado este mes O si está pendiente
+    return (fechaTrab && fechaTrab.startsWith(mk)) || (fechaPago && fechaPago.startsWith(mk)) || !o.pagado;
+  }).filter(function(o){ return o.monto > 0; });
+
+  var total = ofrsMes.reduce(function(s,o){return s+o.monto;},0);
+  var dado  = ofrsMes.filter(function(o){return o.pagado;}).reduce(function(s,o){return s+o.monto;},0);
   document.getElementById('ofr-total').textContent = fmt(total);
   document.getElementById('ofr-dado').textContent  = fmt(dado);
 
   var el = document.getElementById('lista-ofrenda');
-  var ofrs = DB.ofrenda.filter(function(o){return o.monto>0;});
-  if (!ofrs.length) { el.innerHTML='<div class="card"><div class="empty"><div class="empty-icon">✨</div>Sin ofrendas registradas</div></div>'; return; }
-  el.innerHTML = ofrs.map(function(o){
+  if (!ofrsMes.length) { el.innerHTML='<div class="card"><div class="empty"><div class="empty-icon">✨</div>Sin ofrendas este mes</div></div>'; return; }
+  el.innerHTML = ofrsMes.map(function(o){
     var t = DB.trabajos.find(function(x){return x.id===o.trabajoId;});
     var nombre = t ? t.cliente+' ('+t.tipo+')' : '?';
     return '<div class="card" style="margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">'+
       '<div>'+
         '<div style="font-size:13px;font-weight:600">'+nombre+'</div>'+
-        '<div style="font-size:11px;color:var(--t2)">Base: '+fmt(o.base)+' → 10% = '+fmt(o.monto)+'</div>'+
+        '<div style="font-size:11px;color:var(--t2)">Base: '+fmt(o.base)+' → 10% = <strong>'+fmt(o.monto)+'</strong></div>'+
       '</div>'+
       (o.pagado
         ? '<span class="badge verde">✓ Dado</span>'
-        : '<button class="btn green" style="font-size:12px;padding:4px 10px" onclick="darOfrenda(\''+o.trabajoId+'\')">Dar</button>'
+        : '<button class="btn green" style="font-size:12px;padding:4px 10px" onclick="darOfrenda(\''+o.trabajoId+'\')">Dar ✨</button>'
       )+
     '</div>';
   }).join('');
